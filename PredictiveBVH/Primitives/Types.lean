@@ -220,5 +220,3 @@ private def hilbertTransposeToIndex (x y z order : Nat) : Nat :=
 def hilbert3D (x y z : Nat) : Nat :=
   let (tx, ty, tz) := hilbertAxesToTranspose x y z 10
   hilbertTransposeToIndex tx ty tz 10
-
-
