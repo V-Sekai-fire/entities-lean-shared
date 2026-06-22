@@ -1,0 +1,4 @@
+# Lean 4 / Lake build artifacts
+/.lake/
+/build/
+.DS_Store
