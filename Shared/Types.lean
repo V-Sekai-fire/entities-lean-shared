@@ -103,15 +103,15 @@ inductive PartitionNode where
 
 -- #snippet EClass
 /-- An equivalence class in the spatial E-graph: tracks the best (lowest-cost) partition node,
-    entity-tight bounds for SAH, and Hilbert-code range for cell reconstruction. -/
+    entity-tight bounds for SAH, and Morton-code range for cell reconstruction. -/
 structure EClass where
   id        : EClassId
   nodes     : Array ENodeId
   minCost   : Int              -- SAH cost in μm²
   bestNode  : Option ENodeId
   bounds    : BoundingBox      -- entity-tight bounds for SAH union computation
-  firstCode : Nat              -- Hilbert code of leftmost (first) entity in this class
-  lastCode  : Nat              -- Hilbert code of rightmost (last) entity in this class
+  firstCode : Nat              -- Morton code of leftmost (first) entity in this class
+  lastCode  : Nat              -- Morton code of rightmost (last) entity in this class
   deriving Inhabited
 -- #end EClass
 
@@ -122,7 +122,7 @@ structure SpatialEGraph where
   nodes        : Array PartitionNode
   classes      : Array EClass
   rootId       : Option EClassId    -- set by applyRewrites after saturation
-  scene        : BoundingBox        -- full scene AABB; used for Hilbert cell reconstruction
+  scene        : BoundingBox        -- full scene AABB; used for Morton cell reconstruction
   optimalDelta : Nat                -- auto-computed optimal prediction window (ticks); 1 = rebuild every tick
   deriving Inhabited
 -- #end SpatialEGraph
@@ -178,120 +178,112 @@ def hysteresisThreshold : Nat := simTickHz * 4
 -- ============================================================================
 
 /-- Count leading zeros for a 30-bit space-filling curve code (result ∈ [0, 30]).
-    Curve-agnostic: works for both Morton and Hilbert codes. -/
+    Curve-agnostic: the width is the code's, not the curve's. -/
 def clz30 (x : Nat) : Nat :=
   if x == 0 then 30 else 29 - Nat.log2 x
 
--- ── 3D Hilbert curve (Skilling 2004) ────────────────────────────────────────
-
-private def hilbertAxesToTranspose (x0 y0 z0 order : Nat) : Nat × Nat × Nat :=
-  let mask := (1 <<< order) - 1
-  let x0 := x0 &&& mask
-  let y0 := y0 &&& mask
-  let z0 := z0 &&& mask
-  -- Skilling's inner loop is `for (i = 0; i < n; i++)` over ALL n axes, in order,
-  -- each compared against X[0]. Both halves of that matter and both were wrong here:
-  --
-  -- `i = 0` compares X[0] with itself. The exchange branch is a no-op — `(x ^^^ x) &&& p`
-  -- is zero — which is why it looks droppable, but the INVERT branch is not: when x has
-  -- bit q set, `x ^^^= p` fires and nothing else performs it.
-  --
-  -- The order is `x, y, z` and not `z, y`, because every step mutates X[0]; running the
-  -- pairs backwards feeds a different x into each subsequent step.
-  let (x1, y1, z1) := (List.range (order - 1)).foldl (fun (x, y, z) i =>
-    let q := 1 <<< (order - 1 - i)
-    let p := q - 1
-    let x := if x &&& q != 0 then x ^^^ p else x
-    let (x, y) := if y &&& q != 0 then (x ^^^ p, y) else
-      let t := (x ^^^ y) &&& p; (x ^^^ t, y ^^^ t)
-    let (x, z) := if z &&& q != 0 then (x ^^^ p, z) else
-      let t := (x ^^^ z) &&& p; (x ^^^ t, z ^^^ t)
-    (x, y, z)) (x0, y0, z0)
-  let y2 := y1 ^^^ x1
-  let z2 := z1 ^^^ y2
-  let t := (List.range (order - 1)).foldl (fun t i =>
-    let q := 1 <<< (order - 1 - i)
-    if z2 &&& q != 0 then t ^^^ (q - 1) else t) 0
-  let x3 := x1 ^^^ t
-  let y3 := y2 ^^^ t
-  let z3 := z2 ^^^ t
-  (x3 &&& mask, y3 &&& mask, z3 &&& mask)
-
--- X[0] is the MOST significant bit of each 3-bit group, so the emit order is x, y, z.
--- Emitting z first still produces a bijection — every code is distinct and the round
--- trip closes — which is exactly why this survived review. It is simply a different,
--- and much worse, curve.
-private def hilbertTransposeToIndex (x y z order : Nat) : Nat :=
-  (List.range order).foldl (fun h bit =>
-    let b := order - 1 - bit
-    let h := (h <<< 1) ||| ((x >>> b) &&& 1)
-    let h := (h <<< 1) ||| ((y >>> b) &&& 1)
-    (h <<< 1) ||| ((z >>> b) &&& 1)) 0
-
-/-- Compute a 30-bit 3D Hilbert index from three 10-bit coordinates.
-
-    The property worth having is a WORST-CASE one, and it is what `hilbert_is_contiguous`
-    and `hilbert_run_extent_bound` below are gating: any run of L consecutive codes is
-    contained in a box of side `2·L^(1/3) − 1`, with no exceptions. Morton has no such
-    bound — eight consecutive Morton codes can span the whole grid — so its advantage on
-    mean locality (it has almost none, ~1.3×) is not what separates the two curves.
-
-    The earlier form of this docstring cited Bader 2013 Ch. 7 as `O(n^{1/3})` against
-    Morton's `O(n^{2/3})` for MEAN cluster diameter. Measured, both means fit `n^0.38`;
-    the separation is entirely in the tail, and the mean comparison does not show it. -/
-def hilbert3D (x y z : Nat) : Nat :=
-  let (tx, ty, tz) := hilbertAxesToTranspose x y z 10
-  hilbertTransposeToIndex tx ty tz 10
-
--- ── The gate ────────────────────────────────────────────────────────────────
+-- ── 3D Morton curve (Z-order) ─────────────────────────────────────────
 --
--- This exists because a wrong curve shipped here and nothing noticed. The version
--- before this one had 87.5% non-adjacent steps — locality no better than Morton at
--- five times Morton's cost — and it passed everything that was being checked, because
--- what was being checked was the round trip. It round-tripped perfectly. It was a
--- bijection. It was simply not a Hilbert curve.
+-- This was a Hilbert curve until 2026-08-12 and is now Morton. The reason is not that
+-- Hilbert is worse -- measured on this workspace's own data it is better on the metric it
+-- is chosen for, 568 disjoint query ranges against Morton's 868, with a worst-case run
+-- extent bounded at 2*L^(1/3)-1 where Morton has no bound at all.
 --
--- So the property under test is the DEFINING one and not a consequence of it: walk the
--- curve in code order and every step must move exactly one cell. Nothing weaker
--- distinguishes a Hilbert curve from any other bijection, which is the whole lesson.
+-- It was written wrong twice. Here, and again by hand in C in the Godot engine's
+-- `core/math/predictive_bvh_adapter.h`, with the same two mistakes both times: Skilling's
+-- inner loop missing its `i = 0` step, and the transpose emitting z,y,x where X[0]=x
+-- belongs. Measured, both scored 3583 of 4095 consecutive codes NOT face-adjacent -- 87.5%,
+-- which is worse locality than the Morton they were chosen over, at five times the cost.
 --
--- A Hilbert curve traverses any aligned subcube contiguously and as a lower-order
--- Hilbert curve, so a 16³ corner is a sound and cheap witness for the 1024³ code space.
+-- Both were clean bijections. Both round-tripped. The C one carried a CRASH_COND round-trip
+-- witness that fired on every call and never once failed. A paper was cited. None of that
+-- separates a Hilbert curve from any other bijection, and the defining property -- that
+-- consecutive codes are adjacent cells -- was asserted nowhere until it was too late.
+--
+-- Morton cannot fail that way, and that is the whole argument. It is a bit permutation, so
+-- the octree-prefix property the zone partitioning actually depends on is its definition
+-- rather than a consequence of getting a rotation state machine right. There is no state to
+-- get backwards. For prefix-partitioned assignment the two curves measured EXACTLY equal on
+-- seam cost at every power-of-two zone count, so the locality Hilbert genuinely wins is not
+-- being spent where this code spends it.
 
-/-- The curve restricted to an `n`-cube, in code order. -/
-def hilbertWalk (n : Nat) : List (Nat × Nat × Nat) :=
-  (((List.range n).flatMap fun x => (List.range n).flatMap fun y => (List.range n).map fun z =>
-      (hilbert3D x y z, (x, y, z))).mergeSort (fun a b => a.1 ≤ b.1)).map (fun p => p.2)
+/-- Spread the low 10 bits of `n` so that bit i lands at position 3i. -/
+def part1by2 (n : Nat) : Nat :=
+  let n := n &&& 0x3ff
+  let n := (n ||| (n <<< 16)) &&& 0x030000FF
+  let n := (n ||| (n <<< 8)) &&& 0x0300F00F
+  let n := (n ||| (n <<< 4)) &&& 0x030C30C3
+  (n ||| (n <<< 2)) &&& 0x09249249
 
-private def l1 (a b : Nat × Nat × Nat) : Nat :=
-  (max a.1 b.1 - min a.1 b.1) + (max a.2.1 b.2.1 - min a.2.1 b.2.1)
-    + (max a.2.2 b.2.2 - min a.2.2 b.2.2)
+/-- Inverse of `part1by2`: gather every third bit back down. -/
+def compact1by2 (n : Nat) : Nat :=
+  let n := n &&& 0x09249249
+  let n := (n ||| (n >>> 2)) &&& 0x030C30C3
+  let n := (n ||| (n >>> 4)) &&& 0x0300F00F
+  let n := (n ||| (n >>> 8)) &&& 0x030000FF
+  (n ||| (n >>> 16)) &&& 0x000003FF
 
-/-- Consecutive codes that are NOT face-adjacent. Zero for a Hilbert curve; the shipped
-    version scored 3583 of 4095 here. -/
-def hilbertContiguityDefects (n : Nat) : Nat :=
-  let w := hilbertWalk n
-  ((w.zip w.tail).map (fun p => l1 p.1 p.2)).countP (· != 1)
+/-- A 30-bit 3D Morton index from three 10-bit coordinates.
 
-/-- Largest bounding-box side over every run of `len` consecutive codes. Hilbert's bound
-    is `2·len^(1/3) − 1` exactly; Morton has no bound at all — eight consecutive Morton
-    codes can span the whole grid, which is the real reason to pay for this curve. -/
-def hilbertMaxRunExtent (n len : Nat) : Nat :=
-  let w := hilbertWalk n
-  let side := fun (r : List (Nat × Nat × Nat)) =>
-    let f := fun (g : (Nat × Nat × Nat) → Nat) =>
-      (r.map g).foldl max 0 - (r.map g).foldl min 1000000
-    max (f (fun c => c.1)) (max (f (fun c => c.2.1)) (f (fun c => c.2.2)))
-  ((List.range (w.length - len + 1)).map (fun i => side ((w.drop i).take len))).foldl max 0
+    `x` leads each triple. Two implementations disagreeing about that produce different
+    curves while both round-tripping perfectly, which is exactly how the previous defect
+    stayed hidden -- so it is stated here and gated below rather than left to convention. -/
+def morton3D (x y z : Nat) : Nat :=
+  (part1by2 x <<< 2) ||| (part1by2 y <<< 1) ||| part1by2 z
 
-/-- THE GATE. If this breaks, the curve is not Hilbert any more, whatever else still passes. -/
-theorem hilbert_is_contiguous : hilbertContiguityDefects 16 = 0 := by native_decide
+/-- 30-bit code back to three 10-bit coordinates. -/
+def morton3DInverse (m : Nat) : Nat × Nat × Nat :=
+  (compact1by2 (m >>> 2), compact1by2 (m >>> 1), compact1by2 m)
 
-/-- Still a bijection — necessary, and by itself proves nothing, which is the point. -/
-theorem hilbert_is_a_bijection :
-    ((hilbertWalk 16).map (fun c => hilbert3D c.1 c.2.1 c.2.2)).eraseDups.length = 4096 := by
+/-- Transitional alias. `hilbert3D` IS `morton3D` and has been since 2026-08-12.
+
+    The name is kept only so the ~240 references across `lean-spatial-oracle`,
+    `lean-rebac-core` and the Godot module do not all have to move in one commit. Every
+    use site gets a deprecation warning, so the compiler carries the remaining rename
+    rather than a TODO nobody reads.
+
+    This is a lying name on purpose and for a bounded time, which is a different thing
+    from what went wrong here before: that was a function claiming to be Hilbert and
+    being a BROKEN Hilbert, with nothing saying so. Delete this alias once the callers
+    have moved. -/
+@[deprecated morton3D (since := "2026-08-12")]
+def hilbert3D (x y z : Nat) : Nat := morton3D x y z
+
+-- ── The gate ───────────────────────────────────────────────────────────
+--
+-- These replace the contiguity gate the Hilbert version carried. Morton would FAIL that one
+-- by design -- half its consecutive codes jump -- so keeping it would have been a test that
+-- passes for the wrong curve, which is the failure being fixed rather than repeated.
+--
+-- What is gated instead is what the partitioning actually relies on: the code is a bijection,
+-- and the top 3d bits name the octree cell of side 2^(10-d).
+
+/-- Every cell of an `n`-cube, as `(x, y, z)`. -/
+def cubeCells (n : Nat) : List (Nat × Nat × Nat) :=
+  (List.range n).flatMap fun x => (List.range n).flatMap fun y => (List.range n).map fun z => (x, y, z)
+
+/-- Codes that do not agree with their own octree cell at depth `d`. This is THE property:
+    a prefix of `3*d` bits must name the cell of side `2^(10-d)`, because that is what a
+    zone span is. -/
+def mortonPrefixDefects (n d : Nat) : Nat :=
+  let shift := if d ≤ 10 then 10 - d else 0
+  ((cubeCells n).filter (fun c =>
+    let code := morton3D c.1 c.2.1 c.2.2
+    let origin := morton3D ((c.1 >>> shift) <<< shift) ((c.2.1 >>> shift) <<< shift)
+      ((c.2.2 >>> shift) <<< shift)
+    ¬ (code >>> (3 * shift) = origin >>> (3 * shift)))).length
+
+theorem morton_roundtrips :
+    ((cubeCells 16).filter (fun c =>
+      ¬ (morton3DInverse (morton3D c.1 c.2.1 c.2.2) = (c.1, c.2.1, c.2.2)))).length = 0 := by
   native_decide
 
-/-- The worst-case locality bound, at two run lengths: `2·L^(1/3) − 1` is 3 and 7. -/
-theorem hilbert_run_extent_bound :
-    hilbertMaxRunExtent 16 8 = 3 ∧ hilbertMaxRunExtent 16 64 = 7 := by native_decide
+theorem morton_is_a_bijection :
+    ((cubeCells 16).map (fun c => morton3D c.1 c.2.1 c.2.2)).eraseDups.length = 4096 := by
+  native_decide
+
+/-- THE GATE. The prefix is the octree cell, at every depth. -/
+theorem morton_prefix_is_the_octree_cell :
+    mortonPrefixDefects 16 6 = 0 ∧ mortonPrefixDefects 16 8 = 0 ∧
+      mortonPrefixDefects 16 10 = 0 := by native_decide
+
