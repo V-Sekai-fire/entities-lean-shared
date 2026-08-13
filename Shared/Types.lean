@@ -189,13 +189,23 @@ private def hilbertAxesToTranspose (x0 y0 z0 order : Nat) : Nat × Nat × Nat :=
   let x0 := x0 &&& mask
   let y0 := y0 &&& mask
   let z0 := z0 &&& mask
+  -- Skilling's inner loop is `for (i = 0; i < n; i++)` over ALL n axes, in order,
+  -- each compared against X[0]. Both halves of that matter and both were wrong here:
+  --
+  -- `i = 0` compares X[0] with itself. The exchange branch is a no-op — `(x ^^^ x) &&& p`
+  -- is zero — which is why it looks droppable, but the INVERT branch is not: when x has
+  -- bit q set, `x ^^^= p` fires and nothing else performs it.
+  --
+  -- The order is `x, y, z` and not `z, y`, because every step mutates X[0]; running the
+  -- pairs backwards feeds a different x into each subsequent step.
   let (x1, y1, z1) := (List.range (order - 1)).foldl (fun (x, y, z) i =>
     let q := 1 <<< (order - 1 - i)
     let p := q - 1
-    let (x, z) := if z &&& q != 0 then (x ^^^ p, z) else
-      let t := (x ^^^ z) &&& p; (x ^^^ t, z ^^^ t)
+    let x := if x &&& q != 0 then x ^^^ p else x
     let (x, y) := if y &&& q != 0 then (x ^^^ p, y) else
       let t := (x ^^^ y) &&& p; (x ^^^ t, y ^^^ t)
+    let (x, z) := if z &&& q != 0 then (x ^^^ p, z) else
+      let t := (x ^^^ z) &&& p; (x ^^^ t, z ^^^ t)
     (x, y, z)) (x0, y0, z0)
   let y2 := y1 ^^^ x1
   let z2 := z1 ^^^ y2
@@ -207,16 +217,81 @@ private def hilbertAxesToTranspose (x0 y0 z0 order : Nat) : Nat × Nat × Nat :=
   let z3 := z2 ^^^ t
   (x3 &&& mask, y3 &&& mask, z3 &&& mask)
 
+-- X[0] is the MOST significant bit of each 3-bit group, so the emit order is x, y, z.
+-- Emitting z first still produces a bijection — every code is distinct and the round
+-- trip closes — which is exactly why this survived review. It is simply a different,
+-- and much worse, curve.
 private def hilbertTransposeToIndex (x y z order : Nat) : Nat :=
   (List.range order).foldl (fun h bit =>
     let b := order - 1 - bit
-    let h := (h <<< 1) ||| ((z >>> b) &&& 1)
+    let h := (h <<< 1) ||| ((x >>> b) &&& 1)
     let h := (h <<< 1) ||| ((y >>> b) &&& 1)
-    (h <<< 1) ||| ((x >>> b) &&& 1)) 0
+    (h <<< 1) ||| ((z >>> b) &&& 1)) 0
 
 /-- Compute a 30-bit 3D Hilbert index from three 10-bit coordinates.
-    Better locality than Morton for volume partitioning:
-    cluster diameter O(n^{1/3}) vs O(n^{2/3}) (Bader 2013, Ch. 7). -/
+
+    The property worth having is a WORST-CASE one, and it is what `hilbert_is_contiguous`
+    and `hilbert_run_extent_bound` below are gating: any run of L consecutive codes is
+    contained in a box of side `2·L^(1/3) − 1`, with no exceptions. Morton has no such
+    bound — eight consecutive Morton codes can span the whole grid — so its advantage on
+    mean locality (it has almost none, ~1.3×) is not what separates the two curves.
+
+    The earlier form of this docstring cited Bader 2013 Ch. 7 as `O(n^{1/3})` against
+    Morton's `O(n^{2/3})` for MEAN cluster diameter. Measured, both means fit `n^0.38`;
+    the separation is entirely in the tail, and the mean comparison does not show it. -/
 def hilbert3D (x y z : Nat) : Nat :=
   let (tx, ty, tz) := hilbertAxesToTranspose x y z 10
   hilbertTransposeToIndex tx ty tz 10
+
+-- ── The gate ────────────────────────────────────────────────────────────────
+--
+-- This exists because a wrong curve shipped here and nothing noticed. The version
+-- before this one had 87.5% non-adjacent steps — locality no better than Morton at
+-- five times Morton's cost — and it passed everything that was being checked, because
+-- what was being checked was the round trip. It round-tripped perfectly. It was a
+-- bijection. It was simply not a Hilbert curve.
+--
+-- So the property under test is the DEFINING one and not a consequence of it: walk the
+-- curve in code order and every step must move exactly one cell. Nothing weaker
+-- distinguishes a Hilbert curve from any other bijection, which is the whole lesson.
+--
+-- A Hilbert curve traverses any aligned subcube contiguously and as a lower-order
+-- Hilbert curve, so a 16³ corner is a sound and cheap witness for the 1024³ code space.
+
+/-- The curve restricted to an `n`-cube, in code order. -/
+def hilbertWalk (n : Nat) : List (Nat × Nat × Nat) :=
+  (((List.range n).flatMap fun x => (List.range n).flatMap fun y => (List.range n).map fun z =>
+      (hilbert3D x y z, (x, y, z))).mergeSort (fun a b => a.1 ≤ b.1)).map (fun p => p.2)
+
+private def l1 (a b : Nat × Nat × Nat) : Nat :=
+  (max a.1 b.1 - min a.1 b.1) + (max a.2.1 b.2.1 - min a.2.1 b.2.1)
+    + (max a.2.2 b.2.2 - min a.2.2 b.2.2)
+
+/-- Consecutive codes that are NOT face-adjacent. Zero for a Hilbert curve; the shipped
+    version scored 3583 of 4095 here. -/
+def hilbertContiguityDefects (n : Nat) : Nat :=
+  let w := hilbertWalk n
+  ((w.zip w.tail).map (fun p => l1 p.1 p.2)).countP (· != 1)
+
+/-- Largest bounding-box side over every run of `len` consecutive codes. Hilbert's bound
+    is `2·len^(1/3) − 1` exactly; Morton has no bound at all — eight consecutive Morton
+    codes can span the whole grid, which is the real reason to pay for this curve. -/
+def hilbertMaxRunExtent (n len : Nat) : Nat :=
+  let w := hilbertWalk n
+  let side := fun (r : List (Nat × Nat × Nat)) =>
+    let f := fun (g : (Nat × Nat × Nat) → Nat) =>
+      (r.map g).foldl max 0 - (r.map g).foldl min 1000000
+    max (f (fun c => c.1)) (max (f (fun c => c.2.1)) (f (fun c => c.2.2)))
+  ((List.range (w.length - len + 1)).map (fun i => side ((w.drop i).take len))).foldl max 0
+
+/-- THE GATE. If this breaks, the curve is not Hilbert any more, whatever else still passes. -/
+theorem hilbert_is_contiguous : hilbertContiguityDefects 16 = 0 := by native_decide
+
+/-- Still a bijection — necessary, and by itself proves nothing, which is the point. -/
+theorem hilbert_is_a_bijection :
+    ((hilbertWalk 16).map (fun c => hilbert3D c.1 c.2.1 c.2.2)).eraseDups.length = 4096 := by
+  native_decide
+
+/-- The worst-case locality bound, at two run lengths: `2·L^(1/3) − 1` is 3 and 7. -/
+theorem hilbert_run_extent_bound :
+    hilbertMaxRunExtent 16 8 = 3 ∧ hilbertMaxRunExtent 16 64 = 7 := by native_decide
