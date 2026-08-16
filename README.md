@@ -1,8 +1,8 @@
-# lean-shared-core
+# entities-lean-shared
 
 Shared primitive types: the common vocabulary every `multiplayer-fabric` hexagon core builds on. Dependency-free (Lean core only).
 
-> Split out of the [`lean-predictive-bvh`](https://github.com/v-sekai-multiplayer-fabric/lean-predictive-bvh) monorepo (now archived). Each hexagon cluster is its own repo following the `core/ports/adapters` convention; cross-cluster wiring is via Lake `require ... from git`.
+> Split out of the [`lean-predictive-bvh`](https://github.com/v-sekai-multiplayer-fabric/lean-predictive-bvh) monorepo (now archived). Cross-cluster wiring is via Lake `require ... from git`.
 
 ## Dependencies
 
@@ -15,8 +15,8 @@ lake build         # production gate: typecheck the Shared cluster
 lake build Research  # research-tier (non-gating; may fail)
 ```
 
-## Hexagon layout
+## Layout
 
-- `core/` — dependency-free domain logic + proofs
-- `ports/` — narrow driving (source) / driven (sink) contracts
-- `adapters/` — concrete I/O at the edges
+- `Shared/` — the primitive types, in one Lean namespace
+
+This repository has no `core/`, `ports/`, or `adapters/` directory. It holds a type vocabulary rather than a hexagon, so there is nothing on either side of a boundary to separate.
