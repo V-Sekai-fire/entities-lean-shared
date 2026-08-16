@@ -1,4 +1,4 @@
-# AGENTS.md — lean-shared-core
+# AGENTS.md — entities-lean-shared
 
 Guidance for AI coding agents working in this repo.
 
